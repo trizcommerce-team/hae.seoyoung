@@ -908,7 +908,7 @@ def parse_overview(sheets):
     seller = CONFIG["seller"].removesuffix("님")
     name = re.sub(rf"^.*?{re.escape(seller)}\s*님?\s*[xX×]\s*", "", title)
     name = re.sub(r"\s*\d{4}\.\d{1,2}\s*$", "", name).strip()
-    out = {"name": name, "fullName": title, "period": None, "info": [], "share": []}
+    out = {"name": name, "fullName": title, "period": None, "info": [], "share": [], "plan": [], "head": {}}
     section, start, end = "", None, None
     for cells in rows:
         if not cells:
@@ -925,6 +925,9 @@ def parse_overview(sheets):
             start = rest
         elif lab == "종료":
             end = rest
+        elif lab == "일정" and "업로드" in section:
+            out["head"] = {c: v.strip() for c, v in cells}
+            continue
         elif "판매 구성" in lab or lab in ("상품명", "진행 시점", "일정"):
             continue
         elif "이벤트" in section and cells:
@@ -932,6 +935,8 @@ def parse_overview(sheets):
         elif "공유 일정" in section:
             out["share"].append(" · ".join(v.strip() for _, v in cells))
         elif "업로드" in section:
+            if lab != "일정":  # 일정 | 컨텐츠 형태 | 주제 | (빈칸) | 콘텐츠 성격 | 제품 노출 | 내용
+                out["plan"].append(cells)
             continue
         elif re.match(r"(배송|제주)", lab):
             out["info"].append({"label": "배송", "text": lab})
@@ -951,7 +956,54 @@ def parse_overview(sheets):
         out["info"].insert(0, {"label": "공구 일정", "text": f"{start.strip()} ~ {end.strip()}"})
     if out["share"]:
         out["info"].append({"label": "초안 공유 일정", "text": "\n".join(out["share"])})
+    merged = []  # 같은 제목(판매 구성·배송·이벤트…)은 한 줄 제목 아래 여러 줄로
+    for x in out["info"]:
+        same = next((m for m in merged if m["label"] == x["label"]), None)
+        if same:
+            same["text"] += "\n" + x["text"]
+        else:
+            merged.append(dict(x))
+    out["info"] = merged
+    head = out["head"]
+    col = lambda key: next((c for c, h in head.items() if key in h), None)
+    c_date, c_fmt, c_topic = col("일정"), col("형태"), col("주제")
+    slots = []
+    for cells in out["plan"]:
+        row = dict(cells)
+        a = row.get(c_date, "")
+        m = DATE_RE.search(a)
+        if not m:
+            continue
+        topic = row.get(c_topic, "").split("\n")
+        fields = {head[c]: row[c].strip() for c in sorted(row) if c not in (c_date, c_fmt, c_topic) and c in head and row[c].strip()}
+        slots.append({"label": slot_label(a), "date": iso(dt.date(YEAR, int(m[1]), int(m[2]))),
+                      "format": (row.get(c_fmt, "") or "기타").strip(), "title": topic[0].strip(),
+                      "notes": [t.strip(" ()") for t in topic[1:] if t.strip()], "items": [fields] if fields else []})
+    out["slots"] = slots
     return out
+
+
+def product_qna(sheets):
+    """'상품 정보' 탭 → 제품 화면의 접는 상자 하나 (제품 정보 + 자주 묻는 질문)"""
+    ws = next((w for w in sheets if "상품 정보" in w.title), None)
+    if ws is None:
+        return None
+    lines, sec = [], ""
+    for r in range(1, ws.max_row + 1):
+        vals = [text(ws.cell(r, c).value).strip() for c in range(1, ws.max_column + 1)]
+        vals = [v for v in vals if v]
+        if not vals or vals[0] in ("구분",) or vals[:2] == ["상품 정보", "제품명"]:
+            if vals[:2] == ["상품 정보", "제품명"] and len(vals) > 2:
+                lines.append(f"제품명: {vals[2]}")
+            continue
+        if len(vals) == 2:
+            lines.append(f"{vals[0]}: {vals[1]}")
+        elif len(vals) >= 3:  # 구분 | Q | A
+            if vals[0] != sec:
+                sec = vals[0]
+                lines.append(f"\n[{sec}]")
+            lines.append(f"Q. {vals[1]}\nA. {vals[2]}")
+    return {"label": "상품 정보", "text": "\n".join(lines).strip()} if lines else None
 
 
 # ---------------------------------------------------------------- 월별 탭
@@ -1286,6 +1338,14 @@ def main():
                 p["fullName"] = p["fullName"] or ov["fullName"]
                 p["period"] = p["period"] or ov["period"]
                 p["info"] = ov["info"] + p["info"]
+                p["fullName"] = None if p["fullName"] == ov["fullName"] else p["fullName"]  # 제목과 겹치는 긴 이름은 빼기
+                kind = lambda f: "story" if "스토리" in f else "feed"
+                have = {(s["date"], kind(s["format"])) for s in p["slots"] if s["date"]}
+                p["slots"] += [s for s in ov["slots"] if (s["date"], kind(s["format"])) not in have]
+                p["slots"].sort(key=lambda s: s["date"] or "9999")
+                qna = product_qna(sheets)
+                if qna:
+                    p["info"].append(qna)
     for p in products:
         order_info(p)
     scan_close_times(sheets, products, product_sheets)  # 공구 마감·결제창 마감 시각 (시트 어디에 적혀 있든)
